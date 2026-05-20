@@ -1,27 +1,28 @@
 # ============================================================================
-# Emotion Recognition Platform — Docker Compose
+# Mntis (Emotion Recognition Platform) — Docker Compose
 # ============================================================================
-# Usage:
-#   docker compose up -d                          Start all services
-#   docker compose up -d --scale media-worker=3   Scale media workers
-#   docker compose up -d --scale inference-worker=2 --scale burner=2
-#   docker compose logs -f orchestrator           Follow logs
-#   docker compose down -v                        Stop + remove volumes
+# Quick start:
+#   docker compose up --build
+#
+# All services use their internal hostnames (postgres, redis, kafka, minio,
+# storage, orchestrator) which match the defaults in each service's Config.
+#
+# Env vars in this file match what the code actually reads.
 # ============================================================================
 
 services:
 
-  # ──────────────────────────────────────────────
-  # INFRASTRUCTURE
-  # ──────────────────────────────────────────────
-
+  # ──────────────────────────────────────────────────────────────────────
+  # Infrastructure
+  # ──────────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     container_name: emotion-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-emotion}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-emotion_dev}
-      POSTGRES_DB: orchestrator_db
+      # init script creates per-service databases below
+      POSTGRES_DB: postgres
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-scripts/init-databases.sql:/docker-entrypoint-initdb.d/01-init-databases.sql
@@ -74,11 +75,14 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      # Single PLAINTEXT listener for all internal traffic
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_MESSAGE_MAX_BYTES: 10485760
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_MESSAGE_MAX_BYTES: 10485760      # 10 MB (base64 crops can be large)
       KAFKA_MAX_REQUEST_SIZE: 10485760
       KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760
       KAFKA_LOG_RETENTION_HOURS: 24
@@ -88,11 +92,10 @@ services:
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 15
-      start_period: 30s
+      retries: 10
     networks:
       - emotion-net
     restart: unless-stopped
@@ -128,44 +131,42 @@ services:
       /bin/sh -c "
         mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
         mc mb local/$${S3_BUCKET} --ignore-existing;
-        mc anonymous set download local/$${S3_BUCKET}/public;
         echo 'Bucket ready';
       "
     environment:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
-      S3_BUCKET: ${S3_BUCKET:-emotion-recognition}
+      S3_BUCKET: ${S3_BUCKET:-emotion}
     networks:
       - emotion-net
 
-  # ──────────────────────────────────────────────
-  # APPLICATION SERVICES
-  # ──────────────────────────────────────────────
-
+  # ──────────────────────────────────────────────────────────────────────
+  # API Services
+  # ──────────────────────────────────────────────────────────────────────
   gateway:
     build:
       context: ../EmotionRecognitionGateway
       dockerfile: Dockerfile
     container_name: emotion-gateway
     environment:
-      # Gateway Config.py reads: REDIS_HOST, REDIS_PORT, POSTGRES_HOST, POSTGRES_PORT,
-      # POSTGRES_USER, POSTGRES_PASSWORD, GATEWAY_DB, ORCHESTRATOR_URL, JWT_SECRET, CORS_ORIGINS
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-emotion}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-emotion_dev}
       GATEWAY_DB: gateway_db
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
       ORCHESTRATOR_URL: http://orchestrator:8001
-      JWT_SECRET: ${JWT_SECRET:-super-secret-dev-key-change-in-prod}
+      STORAGE_SERVICE_URL: http://storage:8002
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-super-secret-dev-key-change-in-prod}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-12}
+      RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-500}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+      UPLOAD_RATE_LIMIT: ${UPLOAD_RATE_LIMIT:-60}
+      UPLOAD_RATE_WINDOW_SECONDS: ${UPLOAD_RATE_WINDOW_SECONDS:-60}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost}
-      TOPIC_MEDIA_TASKS: media_tasks
-      TOPIC_MEDIA_RESULTS: media_results
-      TOPIC_INFERENCE_TASKS: inference_tasks
-      TOPIC_INFERENCE_RESULTS: inference_results
-      TOPIC_BURN_TASKS: burn_tasks
-      TOPIC_BURN_RESULTS: burn_results
     ports:
       - "8000:8000"
     depends_on:
@@ -174,12 +175,9 @@ services:
       redis:
         condition: service_healthy
       orchestrator:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+        condition: service_started
+      storage:
+        condition: service_started
     networks:
       - emotion-net
     restart: unless-stopped
@@ -190,18 +188,24 @@ services:
       dockerfile: Dockerfile
     container_name: emotion-orchestrator
     environment:
-      # Orchestrator Config.py reads: KAFKA_BOOTSTRAP_SERVERS, REDIS_HOST, REDIS_PORT,
-      # POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD, ORCHESTRATOR_DB,
-      # STORAGE_SERVICE_URL
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-emotion}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-emotion_dev}
       ORCHESTRATOR_DB: orchestrator_db
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ORCHESTRATOR_GROUP_ID: orchestrator
+      MEDIA_TASKS_TOPIC: media_tasks
+      MEDIA_RESULTS_TOPIC: media_results
+      INFERENCE_TASKS_TOPIC: inference_tasks
+      INFERENCE_RESULTS_TOPIC: inference_results
+      BURN_TASKS_TOPIC: burn_tasks
+      BURN_RESULTS_TOPIC: burn_results
       STORAGE_SERVICE_URL: http://storage:8002
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-super-secret-dev-key-change-in-prod}
+      WS_MAX_FRAME_SIZE: ${WS_MAX_FRAME_SIZE:-2097152}
     ports:
       - "8001:8001"
     depends_on:
@@ -211,11 +215,8 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/api/health')\""]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      storage:
+        condition: service_started
     networks:
       - emotion-net
     restart: unless-stopped
@@ -226,15 +227,20 @@ services:
       dockerfile: Dockerfile
     container_name: emotion-storage
     environment:
-      # Storage Config.py reads: DATABASE_URL (single connection string), S3_ENDPOINT,
-      # S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, KAFKA_BOOTSTRAP
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-emotion}:${POSTGRES_PASSWORD:-emotion_dev}@postgres:5432/storage_db
-      KAFKA_BOOTSTRAP: kafka:9092
-      S3_ENDPOINT: http://minio:9000
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-emotion}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-emotion_dev}
+      STORAGE_DB: storage_db
+      S3_INTERNAL_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
-      S3_BUCKET: ${S3_BUCKET:-emotion-recognition}
-      S3_REGION: us-east-1
+      S3_BUCKET: ${S3_BUCKET:-emotion}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      PRESIGN_UPLOAD_TTL_SECONDS: ${PRESIGN_UPLOAD_TTL_SECONDS:-900}
+      PRESIGN_DOWNLOAD_TTL_SECONDS: ${PRESIGN_DOWNLOAD_TTL_SECONDS:-3600}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
     ports:
       - "8002:8002"
     depends_on:
@@ -242,88 +248,121 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
-      interval: 10s
-      timeout: 5s
-      retries: 5
     networks:
       - emotion-net
     restart: unless-stopped
 
+  # ──────────────────────────────────────────────────────────────────────
+  # Workers (no port — Kafka consumers)
+  # ──────────────────────────────────────────────────────────────────────
   media-worker:
     build:
       context: ../EmotionRecognitionMedia
       dockerfile: Dockerfile
     environment:
-      # Media Config.py reads: KAFKA_BOOTSTRAP, KAFKA_GROUP_ID
-      KAFKA_BOOTSTRAP: kafka:9092
-      KAFKA_GROUP_ID: media-worker-group
-      TOPIC_MEDIA_TASKS: media_tasks
-      TOPIC_MEDIA_RESULTS: media_results
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MEDIA_TASKS_TOPIC: media_tasks
+      MEDIA_RESULTS_TOPIC: media_results
+      MEDIA_GROUP_ID: media-workers
       WORKER_ID: media-worker-${HOSTNAME:-1}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      S3_INTERNAL_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-emotion}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      STORAGE_SERVICE_URL: http://storage:8002
     depends_on:
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      storage:
+        condition: service_started
     networks:
       - emotion-net
     restart: unless-stopped
-    deploy:
-      replicas: ${MEDIA_WORKER_REPLICAS:-1}
 
   inference-worker:
     build:
       context: ../EmotionRecognitionInference
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.cpu     # change to Dockerfile (GPU) if available
     environment:
-      # Inference Config.py reads: KAFKA_BOOTSTRAP, KAFKA_GROUP_ID
-      KAFKA_BOOTSTRAP: kafka:9092
-      KAFKA_GROUP_ID: inference-worker-group
-      TOPIC_INFERENCE_TASKS: inference_tasks
-      TOPIC_INFERENCE_RESULTS: inference_results
-      MODEL_PATH: /app/models/best_model.pth
-      DEVICE: ${INFERENCE_DEVICE:-cpu}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      INFERENCE_TASKS_TOPIC: inference_tasks
+      INFERENCE_RESULTS_TOPIC: inference_results
+      INFERENCE_GROUP_ID: inference-workers
       WORKER_ID: inference-worker-${HOSTNAME:-1}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MODEL_PATH: /models/multi_stream_emotion.pt
+      DEVICE: ${DEVICE:-cpu}
+      NUM_CLASSES: 7
+      INFERENCE_BATCH_SIZE: 1
     volumes:
-      - model_weights:/app/models:ro
+      # Mount your trained model in here. Replace ./models with the
+      # actual folder on the host that contains multi_stream_emotion.pt
+      - ./models:/models:ro
     depends_on:
       kafka:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     networks:
       - emotion-net
     restart: unless-stopped
-    deploy:
-      replicas: ${INFERENCE_WORKER_REPLICAS:-1}
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
 
   burner:
     build:
       context: ../EmotionRecognitionBurner
       dockerfile: Dockerfile
     environment:
-      # Burner Config.py reads: KAFKA_BOOTSTRAP, KAFKA_GROUP_ID
-      KAFKA_BOOTSTRAP: kafka:9092
-      KAFKA_GROUP_ID: burner-worker-group
-      TOPIC_BURN_TASKS: burn_tasks
-      TOPIC_BURN_RESULTS: burn_results
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      BURN_TASKS_TOPIC: burn_tasks
+      BURN_RESULTS_TOPIC: burn_results
+      BURN_GROUP_ID: burner-workers
       WORKER_ID: burner-${HOSTNAME:-1}
+      S3_INTERNAL_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-emotion}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      STORAGE_SERVICE_URL: http://storage:8002
     depends_on:
       kafka:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+      storage:
+        condition: service_started
     networks:
       - emotion-net
     restart: unless-stopped
-    deploy:
-      replicas: ${BURNER_REPLICAS:-1}
 
-  # ──────────────────────────────────────────────
-  # REVERSE PROXY
-  # ──────────────────────────────────────────────
+  # ──────────────────────────────────────────────────────────────────────
+  # Frontend + Edge
+  # ──────────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ../emotion-frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8001/ws}
+    container_name: emotion-frontend
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8001/ws}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - gateway
+    networks:
+      - emotion-net
+    restart: unless-stopped
 
   nginx:
     image: nginx:1.25-alpine
@@ -335,15 +374,12 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
     depends_on:
-      gateway:
-        condition: service_healthy
+      - gateway
+      - orchestrator
+      - frontend
     networks:
       - emotion-net
     restart: unless-stopped
-
-# ──────────────────────────────────────────────
-# VOLUMES
-# ──────────────────────────────────────────────
 
 volumes:
   postgres_data:
@@ -351,11 +387,6 @@ volumes:
   zookeeper_data:
   kafka_data:
   minio_data:
-  model_weights:
-
-# ──────────────────────────────────────────────
-# NETWORKS
-# ──────────────────────────────────────────────
 
 networks:
   emotion-net:
