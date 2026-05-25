@@ -75,14 +75,13 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      # Single PLAINTEXT listener for all internal traffic
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_MESSAGE_MAX_BYTES: 10485760      # 10 MB (base64 crops can be large)
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
       KAFKA_MAX_REQUEST_SIZE: 10485760
       KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760
       KAFKA_LOG_RETENTION_HOURS: 24
@@ -131,6 +130,7 @@ services:
       /bin/sh -c "
         mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
         mc mb local/$${S3_BUCKET} --ignore-existing;
+        mc anonymous set download local/$${S3_BUCKET};
         echo 'Bucket ready';
       "
     environment:
@@ -233,7 +233,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-emotion_dev}
       STORAGE_DB: storage_db
       S3_INTERNAL_ENDPOINT: http://minio:9000
-      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-https://mntis.app/s3}
+      # Browser-facing endpoint. Must be reachable from the user's machine.
+      # The s3.<domain> subdomain pattern is the standard so nginx can
+      # forward 1:1 without breaking the AWS signature on the path.
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-https://s3.mntis.app}
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
       S3_BUCKET: ${S3_BUCKET:-emotion}
@@ -289,7 +292,7 @@ services:
   inference-worker:
     build:
       context: ../EmotionRecognitionInference
-      dockerfile: Dockerfile.cpu     # change to Dockerfile (GPU) if available
+      dockerfile: Dockerfile.cpu
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       INFERENCE_TASKS_TOPIC: inference_tasks
@@ -303,8 +306,6 @@ services:
       NUM_CLASSES: 7
       INFERENCE_BATCH_SIZE: 1
     volumes:
-      # Mount your trained model in here. Replace ./models with the
-      # actual folder on the host that contains multi_stream_emotion.pt
       - ./models:/models:ro
     depends_on:
       kafka:
@@ -378,6 +379,7 @@ services:
       - gateway
       - orchestrator
       - frontend
+      - minio
     networks:
       - emotion-net
     restart: unless-stopped
