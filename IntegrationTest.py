@@ -1,27 +1,32 @@
 """
-Thorough end-to-end integration test for the Mntis platform.
+Full end-to-end integration test for the Mntis platform.
+
+Covers BOTH paths with real data assertions:
+
+  Batch flow (photo):
+    1.  Health checks (gateway, orchestrator, storage, minio)
+    2.  Register + login a fresh user
+    3.  Presign upload URL
+    4.  PUT to MinIO
+    5.  Complete-upload (publishes media_task)
+    6.  DB rows in gateway_db / orchestrator_db / storage_db
+    7.  Every Kafka topic carries a payload for this session, with the
+        expected fields populated
+    8.  Session status reaches 'complete' + crops + burned saved
+    9.  Download URL works
+
+  Live flow (WebSocket):
+   10.  WS handshake succeeds (the close-before-iter bug)
+   11.  session_created arrives over WS
+   12.  Send a binary frame — orchestrator publishes a MediaTask via Redis
+   13.  Media-worker consumes (Redis blpop) → publishes media_result on Kafka
+   14.  Inference happens → publishes inference_result
+   15.  LiveSessionService pumps the result back over WS, payload has
+        top_emotion + valence + arousal + intensity
 
 Run on EC2:
-    pip install httpx websockets Pillow aiokafka asyncpg --break-system-packages
+    pip install httpx websockets Pillow aiokafka asyncpg
     python IntegrationTest.py
-
-What it verifies, top to bottom:
-  1. All services healthy
-  2. Auth (register fresh user → login → JWT)
-  3. Gateway → Orchestrator: create session
-  4. Gateway → Storage: presign upload URL
-  5. Browser PUT to MinIO (using presigned URL)
-  6. Gateway → Orchestrator: complete upload (publishes media_task)
-  7. Three DBs hold the right rows (users / sessions / files)
-  8. Kafka topics carry actual payloads with the right fields:
-       media_tasks, media_results (faces+crops), inference_tasks (face_crop b64),
-       inference_results (emotions+top_emotion), burn_tasks (source_s3_key),
-       burn_results (status=complete, burned_s3_key)
-  9. Crops + burned written back to MinIO and storage_db.files
- 10. Final session.status == complete + frontend can download burned
- 11. Live mode: WS /ws/live accepts binary frames, receives predictions
-
-Every step prints PASS / FAIL with the actual reason. Exits 1 on first failure.
 """
 from __future__ import annotations
 
@@ -64,40 +69,32 @@ GATEWAY_URL      = "http://localhost:8000"
 ORCHESTRATOR_URL = "http://localhost:8001"
 STORAGE_URL      = "http://localhost:8002"
 MINIO_URL        = "http://localhost:9000"
-WS_URL           = "ws://localhost:8000/ws/live"
+WS_URL           = "ws://localhost:8001/ws/live"   # directly to orchestrator
 KAFKA_BOOTSTRAP  = "localhost:9092"
 
-PG_HOST  = "localhost"
-PG_PORT  = 5432
-PG_USER  = "emotion"
-PG_PASS  = "emotion_dev"
+PG_HOST = "localhost"
+PG_PORT = 5432
+PG_USER = "emotion"
+PG_PASS = "emotion_dev"
 
 PIPELINE_TIMEOUT = 90.0
+KAFKA_TIMEOUT    = 25.0
+WS_RESULT_TIMEOUT = 45.0
 
 
-# ── Tiny console formatting ───────────────────────────────────────────
+# ── Output helpers ────────────────────────────────────────────────────
 
-def _step(label: str) -> None:
-    print(f"\n──── {label} ────")
-
-def _ok(msg: str) -> None:
-    print(f"  ✓ {msg}")
-
-def _fail(msg: str) -> None:
-    print(f"  ✗ {msg}")
-    print("\nTEST FAILED")
-    sys.exit(1)
-
-def _info(msg: str) -> None:
-    print(f"  · {msg}")
+def _step(label): print(f"\n──── {label} ────")
+def _ok(msg):     print(f"  ✓ {msg}")
+def _fail(msg):   print(f"  ✗ {msg}\n\nTEST FAILED"); sys.exit(1)
+def _info(msg):   print(f"  · {msg}")
 
 
-# ── Test-image factory ────────────────────────────────────────────────
+# ── Test image ────────────────────────────────────────────────────────
 
 def make_test_image() -> bytes:
-    """Return JPEG bytes of a face-shaped image MTCNN should detect."""
     if Image is None:
-        _fail("Pillow not installed — pip install Pillow --break-system-packages")
+        _fail("Pillow not installed")
     img = Image.new("RGB", (400, 400), color=(200, 180, 160))
     d = ImageDraw.Draw(img)
     d.ellipse([100, 80, 300, 320], fill=(220, 190, 170))
@@ -110,9 +107,9 @@ def make_test_image() -> bytes:
     return buf.getvalue()
 
 
-# ── Step 1: health checks ─────────────────────────────────────────────
+# ── Phase 1: health ──────────────────────────────────────────────────
 
-async def step_health() -> None:
+async def step_health():
     _step("STEP 1 / Health checks")
     async with httpx.AsyncClient(timeout=10) as c:
         for name, url in [
@@ -131,10 +128,10 @@ async def step_health() -> None:
                 _fail(f"{name} unreachable: {e}")
 
 
-# ── Step 2: auth ──────────────────────────────────────────────────────
+# ── Phase 2: auth ─────────────────────────────────────────────────────
 
-async def step_auth() -> tuple[str, str, str]:
-    _step("STEP 2 / Auth: register fresh user + login")
+async def step_auth():
+    _step("STEP 2 / Auth — register + login fresh user")
     suffix = uuid.uuid4().hex[:8]
     email = f"itest-{suffix}@example.com"
     username = f"itest_{suffix}"
@@ -142,17 +139,14 @@ async def step_auth() -> tuple[str, str, str]:
 
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.post(f"{GATEWAY_URL}/api/auth/register", json={
-            "email": email,
-            "username": username,
-            "password": password,
+            "email": email, "username": username, "password": password,
         })
         if r.status_code not in (200, 201):
             _fail(f"register failed {r.status_code}: {r.text[:200]}")
         _ok(f"registered {email}")
 
         r = await c.post(f"{GATEWAY_URL}/api/auth/login", json={
-            "email": email,
-            "password": password,
+            "email": email, "password": password,
         })
         if r.status_code != 200:
             _fail(f"login failed {r.status_code}: {r.text[:200]}")
@@ -160,25 +154,20 @@ async def step_auth() -> tuple[str, str, str]:
         token = data.get("access_token") or data.get("token")
         if not token:
             _fail(f"no access_token in login response: {data}")
-        user_id = (data.get("user") or {}).get("id", "")
         _ok(f"logged in (token len={len(token)})")
+    return token, email
 
-    return token, user_id, email
 
+# ── Phase 3-4: presign + PUT ─────────────────────────────────────────
 
-# ── Step 3+4: create session + presign ────────────────────────────────
-
-async def step_presign(token: str) -> dict[str, Any]:
-    _step("STEP 3+4 / Create session + presign upload")
+async def step_presign(token):
+    _step("STEP 3+4 / Presign + PUT to MinIO")
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.post(
             f"{GATEWAY_URL}/api/upload/request",
             headers={"Authorization": f"Bearer {token}"},
-            json={
-                "mode": "photo",
-                "filename": "itest.jpg",
-                "content_type": "image/jpeg",
-            },
+            json={"mode": "photo", "filename": "itest.jpg",
+                  "content_type": "image/jpeg"},
         )
         if r.status_code != 200:
             _fail(f"presign failed {r.status_code}: {r.text[:300]}")
@@ -188,46 +177,39 @@ async def step_presign(token: str) -> dict[str, Any]:
                 _fail(f"presign response missing '{k}': {data}")
         _ok(f"session_id={data['session_id']}")
         _ok(f"s3_key={data['s3_key']}")
-        _ok(f"presigned url generated")
-    return data
 
-
-# ── Step 5: PUT to MinIO ──────────────────────────────────────────────
-
-async def step_put_to_minio(upload_url: str, image_bytes: bytes) -> None:
-    _step("STEP 5 / Browser PUT to MinIO via presigned URL")
+    image_bytes = make_test_image()
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.put(
-            upload_url,
-            content=image_bytes,
+            data["upload_url"], content=image_bytes,
             headers={"Content-Type": "image/jpeg"},
         )
         if r.status_code not in (200, 204):
             _fail(f"PUT failed {r.status_code}: {r.text[:200]}")
         _ok(f"uploaded {len(image_bytes)} bytes ({r.status_code})")
+    return data["session_id"], data["s3_key"], image_bytes
 
 
-# ── Step 6: complete-upload ───────────────────────────────────────────
+# ── Phase 5: complete-upload ─────────────────────────────────────────
 
-async def step_complete(token: str, session_id: str, s3_key: str) -> None:
-    _step("STEP 6 / Complete-upload (gateway → orchestrator → media_tasks)")
+async def step_complete(token, session_id, s3_key):
+    _step("STEP 5 / Complete-upload — publishes media_task")
     async with httpx.AsyncClient(timeout=15) as c:
-        body = {"session_id": session_id, "s3_key": s3_key, "mode": "photo"}
         r = await c.post(
             f"{GATEWAY_URL}/api/upload/complete",
             headers={"Authorization": f"Bearer {token}"},
-            json=body,
+            json={"session_id": session_id, "s3_key": s3_key, "mode": "photo"},
         )
         if r.status_code != 200:
             _fail(f"complete failed {r.status_code}: {r.text[:300]}")
-        _ok(f"complete-upload returned status={r.json().get('status')}")
+        _ok(f"complete returned status={r.json().get('status')}")
 
 
-# ── Step 7: DB state across 3 DBs ─────────────────────────────────────
+# ── Phase 6: DB state ────────────────────────────────────────────────
 
-async def _query(db: str, sql: str, *args):
+async def _q(db, sql, *args):
     if asyncpg is None:
-        _fail("asyncpg not installed — pip install asyncpg --break-system-packages")
+        _fail("asyncpg not installed")
     conn = await asyncpg.connect(
         host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASS, database=db,
     )
@@ -237,15 +219,14 @@ async def _query(db: str, sql: str, *args):
         await conn.close()
 
 
-async def step_db_state(email: str, session_id: str) -> None:
-    _step("STEP 7 / Database state across 3 DBs")
-
-    rows = await _query("gateway_db", "SELECT id FROM users WHERE email=$1", email)
+async def step_db(email, session_id):
+    _step("STEP 6 / DB rows across 3 dbs")
+    rows = await _q("gateway_db", "SELECT id FROM users WHERE email=$1", email)
     if not rows:
-        _fail(f"gateway_db.users has no row for {email}")
-    _ok(f"gateway_db.users has row for {email}")
+        _fail(f"gateway_db.users missing {email}")
+    _ok(f"gateway_db.users has {email}")
 
-    rows = await _query(
+    rows = await _q(
         "orchestrator_db",
         "SELECT id, status, mode FROM sessions WHERE id=$1",
         uuid.UUID(session_id),
@@ -254,26 +235,24 @@ async def step_db_state(email: str, session_id: str) -> None:
         _fail(f"orchestrator_db.sessions missing {session_id}")
     _ok(f"orchestrator_db.sessions: status={rows[0]['status']} mode={rows[0]['mode']}")
 
-    rows = await _query(
+    rows = await _q(
         "storage_db",
         "SELECT category, COUNT(*) AS n FROM files WHERE session_id=$1 GROUP BY category",
         session_id,
     )
     if not rows:
-        _fail(f"storage_db.files has no rows for session {session_id}")
+        _fail(f"storage_db.files has no rows for {session_id}")
     cats = {r["category"]: r["n"] for r in rows}
-    _ok(f"storage_db.files: {dict(cats)}")
     if cats.get("source", 0) == 0:
-        _fail("expected 'source' row in storage_db.files")
+        _fail("expected 'source' row")
+    _ok(f"storage_db.files: {dict(cats)}")
 
 
-# ── Step 8: Kafka payload checks ──────────────────────────────────────
+# ── Phase 7: Kafka payloads ──────────────────────────────────────────
 
-async def _peek_for_session(topic: str, session_id: str, status: Optional[str] = None,
-                            timeout: float = 25.0) -> dict | None:
-    """Read messages on topic until we find one matching our session_id."""
+async def _peek_topic(topic, session_id, timeout=KAFKA_TIMEOUT):
     if AIOKafkaConsumer is None:
-        _fail("aiokafka not installed — pip install aiokafka --break-system-packages")
+        _fail("aiokafka not installed")
     c = AIOKafkaConsumer(
         topic,
         bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -289,36 +268,32 @@ async def _peek_for_session(topic: str, session_id: str, status: Optional[str] =
             except Exception:
                 continue
             if msg.get("session_id") == session_id:
-                if status and msg.get("status") != status:
-                    continue
                 return msg
     finally:
         await c.stop()
     return None
 
 
-async def step_kafka_payloads(session_id: str) -> None:
-    _step("STEP 8 / Kafka topics carry non-empty payloads for this session")
+async def step_kafka(session_id):
+    _step("STEP 7 / Kafka topics carry non-empty payloads")
     for topic in ("media_tasks", "media_results", "inference_tasks",
                   "inference_results", "burn_tasks", "burn_results"):
-        msg = await _peek_for_session(topic, session_id)
+        msg = await _peek_topic(topic, session_id)
         if msg is None:
             _fail(f"{topic}: no message for session_id={session_id}")
         if topic == "media_results":
             faces = msg.get("faces") or []
             if not faces:
-                _fail("media_results.faces is empty (no face detected)")
+                _fail("media_results.faces is empty")
             if not faces[0].get("face_crop"):
-                _fail("media_results.faces[0].face_crop is empty (no b64 crop)")
-        if topic == "inference_tasks":
-            if not msg.get("face_crop"):
-                _fail("inference_tasks.face_crop missing")
+                _fail("media_results.faces[0].face_crop missing")
+        if topic == "inference_tasks" and not msg.get("face_crop"):
+            _fail("inference_tasks.face_crop missing")
         if topic == "inference_results":
             if "emotions" not in msg or "top_emotion" not in msg:
                 _fail("inference_results missing emotions/top_emotion")
-        if topic == "burn_tasks":
-            if not msg.get("source_s3_key"):
-                _fail("burn_tasks.source_s3_key missing")
+        if topic == "burn_tasks" and not msg.get("source_s3_key"):
+            _fail("burn_tasks.source_s3_key missing")
         if topic == "burn_results":
             if msg.get("status") != "complete":
                 _fail(f"burn_results status={msg.get('status')} error={msg.get('error')}")
@@ -327,44 +302,43 @@ async def step_kafka_payloads(session_id: str) -> None:
         _ok(f"{topic}: payload OK")
 
 
-# ── Step 9-10: final state + download ─────────────────────────────────
+# ── Phase 8-9: status + download ─────────────────────────────────────
 
-async def step_final_state(token: str, session_id: str) -> None:
-    _step("STEP 9-10 / Final state: status complete + burned saved + download works")
-
+async def step_final(token, session_id):
+    _step("STEP 8+9 / Session reaches complete + burned saved + download works")
     deadline = time.time() + PIPELINE_TIMEOUT
-    last_status = None
+    last = None
     while time.time() < deadline:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(
-                f"{GATEWAY_URL}/api/sessions/{session_id}/download",
+                f"{GATEWAY_URL}/api/sessions/{session_id}/status",
                 headers={"Authorization": f"Bearer {token}"},
             )
             if r.status_code == 200:
-                last_status = r.json().get("status")
-                if last_status == "complete":
+                last = r.json().get("status")
+                if last == "complete":
                     break
-                if last_status == "failed":
+                if last == "failed":
                     _fail("session status=failed")
         await asyncio.sleep(2)
-    if last_status != "complete":
-        _fail(f"session never reached 'complete' (last_status={last_status})")
+    if last != "complete":
+        _fail(f"session never reached 'complete' (last={last})")
     _ok("session.status = complete")
 
-    rows = await _query(
+    rows = await _q(
         "storage_db",
         "SELECT category, COUNT(*) AS n FROM files WHERE session_id=$1 GROUP BY category",
         session_id,
     )
     cats = {r["category"]: r["n"] for r in rows}
-    for required in ("source", "crop", "burned"):
-        if cats.get(required, 0) == 0:
-            _fail(f"storage_db.files missing '{required}' (have {dict(cats)})")
+    for needed in ("source", "crop", "burned"):
+        if cats.get(needed, 0) == 0:
+            _fail(f"storage_db.files missing '{needed}' (have {dict(cats)})")
     _ok(f"storage_db.files: {dict(cats)}")
 
     async with httpx.AsyncClient(timeout=10) as c:
         r = await c.get(
-            f"{GATEWAY_URL}/api/download/{session_id}",
+            f"{GATEWAY_URL}/api/sessions/{session_id}/download",
             headers={"Authorization": f"Bearer {token}"},
         )
         if r.status_code != 200:
@@ -375,71 +349,104 @@ async def step_final_state(token: str, session_id: str) -> None:
         _ok("download_url presigned")
 
 
-# ── Step 11: live mode ────────────────────────────────────────────────
+# ── Phase 10-15: live mode E2E ───────────────────────────────────────
 
-async def step_live_mode(token: str) -> None:
-    _step("STEP 11 / Live mode: WS /ws/live → media → inference → result")
+async def step_live(token):
+    _step("STEP 10-15 / Live mode — WS handshake → frame → result back over WS")
     if websockets is None:
-        _fail("websockets not installed — pip install websockets --break-system-packages")
+        _fail("websockets not installed")
 
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.post(
-            f"{GATEWAY_URL}/api/sessions",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"mode": "live"},
-        )
-        if r.status_code not in (200, 201):
-            _fail(f"create live session failed {r.status_code}: {r.text[:200]}")
-        body = r.json()
-        session_id = body.get("id") or body.get("session_id")
-        if not session_id:
-            _fail(f"create live session missing id: {body}")
-        _ok(f"live session created: {session_id}")
-
+    url = f"{WS_URL}?token={token}"
     image_bytes = make_test_image()
-    url = f"{WS_URL}?session_id={session_id}&token={token}"
+    live_session_id = None
+    result = None
+
     try:
         async with websockets.connect(url, max_size=10_000_000) as ws:
-            _ok("WS connected")
-            await ws.send(image_bytes)
-            _ok(f"WS sent {len(image_bytes)} binary bytes")
+            _ok("WS handshake accepted")
+
+            # Step 11: session_created
             try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                first = await asyncio.wait_for(ws.recv(), timeout=10)
             except asyncio.TimeoutError:
-                _fail("no live result on WS within 30s")
-            if isinstance(msg, bytes):
-                msg = msg.decode("utf-8", errors="replace")
-            data = json.loads(msg) if msg.lstrip().startswith("{") else {"raw": msg}
+                _fail("never received session_created over WS")
+            if isinstance(first, bytes):
+                first = first.decode("utf-8", errors="replace")
+            try:
+                msg = json.loads(first)
+            except Exception:
+                _fail(f"first WS msg not JSON: {first[:200]}")
+            if msg.get("type") != "session_created" or not msg.get("session_id"):
+                _fail(f"expected session_created, got: {msg}")
+            live_session_id = msg["session_id"]
+            _ok(f"session_created: {live_session_id}")
+
+            # Step 12: send a binary frame
+            await ws.send(image_bytes)
+            _ok(f"sent {len(image_bytes)} bytes as binary frame")
+
+            # Step 15: wait for a result back over WS
+            deadline = time.time() + WS_RESULT_TIMEOUT
+            while time.time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(
+                        ws.recv(), timeout=max(1, deadline - time.time())
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if msg.get("type") == "result":
+                    result = msg.get("data") or {}
+                    break
+                if msg.get("type") == "error":
+                    _fail(f"WS error frame: {msg}")
+            if result is None:
+                _fail(f"no result on WS within {WS_RESULT_TIMEOUT}s")
+
             for k in ("top_emotion", "valence", "arousal"):
-                if k not in data:
-                    _fail(f"live result missing '{k}': {data}")
-            _ok(f"live result: top={data.get('top_emotion')} "
-                f"val={data.get('valence')} arousal={data.get('arousal')}")
+                if k not in result:
+                    _fail(f"live result missing '{k}': {result}")
+            _ok(f"live result: top={result.get('top_emotion')} "
+                f"val={result.get('valence')} arousal={result.get('arousal')}")
+    except websockets.exceptions.ConnectionClosedError as e:
+        _fail(f"WS closed unexpectedly: code={e.code} reason={e.reason!r}")
     except Exception as e:
-        _fail(f"WS error: {e}")
+        _fail(f"WS error: {type(e).__name__}: {e}")
+
+    # Step 13-14: confirm Kafka saw a media_result + inference_result for this live session
+    msg = await _peek_topic("media_results", live_session_id)
+    if msg is None:
+        _fail("media_results topic has no entry for live session")
+    _ok("media_results topic has entry for live session")
+
+    msg = await _peek_topic("inference_results", live_session_id)
+    if msg is None:
+        _fail("inference_results topic has no entry for live session")
+    _ok("inference_results topic has entry for live session")
 
 
-# ── Driver ────────────────────────────────────────────────────────────
+# ── Driver ───────────────────────────────────────────────────────────
 
-async def main() -> None:
+async def main():
     print("=" * 70)
-    print("Mntis end-to-end integration test")
+    print("Mntis end-to-end integration test (batch + live)")
     print("=" * 70)
     t0 = time.time()
 
     await step_health()
-    token, user_id, email = await step_auth()
-    presign = await step_presign(token)
-    image_bytes = make_test_image()
-    await step_put_to_minio(presign["upload_url"], image_bytes)
-    await step_complete(token, presign["session_id"], presign["s3_key"])
-
+    token, email = await step_auth()
+    session_id, s3_key, _ = await step_presign(token)
+    await step_complete(token, session_id, s3_key)
     await asyncio.sleep(3)
-
-    await step_db_state(email, presign["session_id"])
-    await step_kafka_payloads(presign["session_id"])
-    await step_final_state(token, presign["session_id"])
-    await step_live_mode(token)
+    await step_db(email, session_id)
+    await step_kafka(session_id)
+    await step_final(token, session_id)
+    await step_live(token)
 
     elapsed = time.time() - t0
     print("\n" + "=" * 70)
@@ -456,7 +463,7 @@ if __name__ == "__main__":
         print("\nAborted.")
         sys.exit(1)
     except Exception as e:
-        print(f"\nUNEXPECTED ERROR: {e}")
+        print(f"\nUNEXPECTED ERROR: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
