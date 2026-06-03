@@ -1,4 +1,4 @@
-**# Mntis — Real-Time Facial Emotion Recognition Platform
+# Mntis — Real-Time Facial Emotion Recognition Platform
 
 Batch and live facial emotion recognition, built on a multi-stream CNN
 trained on public emotion datasets and an event-driven microservices
@@ -38,6 +38,38 @@ consume independently. The model lives in a dedicated **Inference
 Worker** that can scale separately from the rest of the stack. The
 **Burner** runs at the end of the batch pipeline to produce the final
 annotated image.
+
+```mermaid
+flowchart TB
+    Browser["Browser<br/><i>Next.js frontend</i>"]
+    Orchestrator["Orchestrator<br/><i>Session + pipeline</i>"]
+    Gateway["Gateway<br/><i>Auth + presign</i>"]
+    Bus["Kafka + Redis<br/><i>Batch + live bus</i>"]
+    Media["Media worker<br/><i>Detect + crop</i>"]
+    Inference["Inference worker<br/><i>Multi-stream CNN</i>"]
+    Burner["Burner<br/><i>Annotate image</i>"]
+    Storage["Storage service<br/><i>File registry + presign</i>"]
+    MinIO["MinIO (S3)<br/><i>Object store</i>"]
+
+    Browser -- REST --> Gateway
+    Browser -- WebSocket --> Orchestrator
+    Gateway --> Orchestrator
+    Orchestrator <--> Bus
+    Bus --> Media
+    Bus --> Inference
+    Bus --> Burner
+    Media --> Storage
+    Inference --> Storage
+    Burner --> Storage
+    Gateway --> Storage
+    Storage --> MinIO
+```
+
+The browser talks REST to the gateway for batch and opens a WebSocket
+direct to the orchestrator for live. Inside, the orchestrator fans
+work out over Kafka (batch handoffs) and Redis (live frame queue +
+result stream) to three workers, each of which writes artifacts back
+through the storage service to MinIO.
 
 ## Services
 
@@ -166,4 +198,4 @@ the upgrade to the orchestrator container). The steps:
   pipeline byte-for-byte (PIL `Image.open` / `.crop` / `.resize` /
   `.save` at JPEG quality 95), because subtle cv2-vs-PIL differences
   in interpolation and color order were producing wrong predictions
-  on real photos despite the model loading correctly.**
+  on real photos despite the model loading correctly.
