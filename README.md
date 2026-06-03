@@ -1,4 +1,4 @@
-# Mntis — Real-Time Facial Emotion Recognition Platform
+**# Mntis — Real-Time Facial Emotion Recognition Platform
 
 Batch and live facial emotion recognition, built on a multi-stream CNN
 trained on public emotion datasets and an event-driven microservices
@@ -166,4 +166,4 @@ the upgrade to the orchestrator container). The steps:
   pipeline byte-for-byte (PIL `Image.open` / `.crop` / `.resize` /
   `.save` at JPEG quality 95), because subtle cv2-vs-PIL differences
   in interpolation and color order were producing wrong predictions
-  on real photos despite the model loading correctly.
+  on real photos despite the model loading correctly.**
