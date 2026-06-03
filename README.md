@@ -166,8 +166,9 @@ the upgrade to the orchestrator container). The steps:
   for landmark-based region polygons. PIL for all image
   manipulation (matches training preprocessing byte-for-byte).
 - **Data:** PostgreSQL (per-service databases — `gateway_db`,
-  `orchestrator_db`, `storage_db`), Redis (live sessions and
-  progress), MinIO (S3-compatible object store).
+  `orchestrator_db`, `storage_db`, schemas managed with Alembic),
+  Redis (live sessions and progress), MinIO (S3-compatible object
+  store).
 - **Infra:** Docker Compose, AWS EC2, nginx reverse proxy,
   Let's Encrypt HTTPS.
 - **Frontend:** Next.js, served via nginx alongside the API.
@@ -187,9 +188,9 @@ the upgrade to the orchestrator container). The steps:
   keeping the trust boundary in one place. The one exception is the
   live-mode WebSocket, which nginx routes straight to the
   orchestrator because that's where the WS handler lives.
-- **Per-service databases.** Each service owns its schema, avoiding
-  shared-database coupling. SQLAlchemy with async sessions in every
-  service.
+- **Per-service databases.** Each service owns its schema (managed
+  with Alembic migrations), avoiding shared-database coupling.
+  SQLAlchemy with async sessions in every service.
 - **Presigned uploads.** Clients upload directly to object storage
   via presigned URLs, so large files never pass through the API.
   Live frames go via WebSocket + Redis instead, since they're small
